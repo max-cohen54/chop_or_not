@@ -11,7 +11,7 @@ from tensorflow.keras.models import load_model
 from sklearn.metrics import roc_curve, auc
 
 
-def load_and_preprocess(standard_scaler=True):
+def load_and_preprocess(data_path, standard_scaler=True):
 
     print('Booting up...\nStarting to load data...\n')
 
@@ -19,13 +19,12 @@ def load_and_preprocess(standard_scaler=True):
     datasets = {}
 
     # Load the data from the hdf5 files
-    base_path = '/eos/home-m/mmcohen/chop_or_not_development/data/'
-    for file_name in os.listdir(base_path):
+    for file_name in os.listdir(data_path):
         if file_name.startswith('.'):
             continue
 
         dataset_name = file_name.split('_')[0]
-        file_path = os.path.join(base_path, file_name)
+        file_path = os.path.join(data_path, file_name)
         print(f'Loading {file_name}...')
         
         with h5py.File(file_path, 'r') as file:
@@ -79,71 +78,285 @@ class Sampling(layers.Layer):
         
 # Create a small VAE.
 def create_small_VAE(input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropout_rate=0):
+    # Use a smaller scale for weight initialization
+    #initializer = tf.keras.initializers.HeNormal(seed=42)  # or use smaller variance
+    initializer = tf.keras.initializers.RandomNormal(mean=0., stddev=0.01)
     
     # Encoder
     encoder_inputs = layers.Input(shape=(input_dim,))
-    x = layers.Dense(h_dim_1, activation='relu', kernel_regularizer=regularizers.l2(l2_reg))(encoder_inputs)
+    x = layers.Dense(h_dim_1, 
+                    activation='relu', 
+                    kernel_regularizer=regularizers.l2(l2_reg),
+                    kernel_initializer=initializer)(encoder_inputs)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(dropout_rate)(x)
     
-    x = layers.Dense(h_dim_2, activation='relu', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    x = layers.Dense(h_dim_2, 
+                    activation='relu', 
+                    kernel_regularizer=regularizers.l2(l2_reg),
+                    kernel_initializer=initializer)(x)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(dropout_rate)(x)
     
-    z_mean = layers.Dense(latent_dim, kernel_regularizer=regularizers.l2(l2_reg))(x)
-    z_log_var = layers.Dense(latent_dim, kernel_regularizer=regularizers.l2(l2_reg))(x)
+    z_mean = layers.Dense(latent_dim, 
+                         kernel_regularizer=regularizers.l2(l2_reg),
+                         kernel_initializer=initializer)(x)
+    z_log_var = layers.Dense(latent_dim, 
+                            kernel_regularizer=regularizers.l2(l2_reg),
+                            kernel_initializer=initializer)(x)
     z = Sampling()([z_mean, z_log_var])
     
     encoder = Model(inputs=encoder_inputs, outputs=[z_mean, z_log_var, z])
 
     # Decoder
     decoder_inputs = layers.Input(shape=(latent_dim,))
-    x = layers.Dense(h_dim_2, activation='relu', kernel_regularizer=regularizers.l2(l2_reg))(decoder_inputs)
+    x = layers.Dense(h_dim_2, 
+                    activation='relu', 
+                    kernel_regularizer=regularizers.l2(l2_reg),
+                    kernel_initializer=initializer)(decoder_inputs)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(dropout_rate)(x)
     
-    x = layers.Dense(h_dim_1, activation='relu', kernel_regularizer=regularizers.l2(l2_reg))(x)
+    x = layers.Dense(h_dim_1, 
+                    activation='relu', 
+                    kernel_regularizer=regularizers.l2(l2_reg),
+                    kernel_initializer=initializer)(x)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(dropout_rate)(x)
     
-    outputs = layers.Dense(input_dim, kernel_regularizer=regularizers.l2(l2_reg))(x)
+    outputs = layers.Dense(input_dim, 
+                         kernel_regularizer=regularizers.l2(l2_reg),
+                         kernel_initializer=initializer)(x)
 
     decoder = Model(inputs=decoder_inputs, outputs=outputs)
 
     mean, log_var, latent = encoder(encoder_inputs)
-
     ae_outputs = [decoder(latent), mean, log_var]
     ae = Model(encoder_inputs, outputs=ae_outputs)
 
     return ae, encoder, decoder
 
-# Loss function for the VAE
-def loss_fn(y_true, model_outputs, beta=0.5):
-    y_pred = model_outputs[0]
-    z_mean = model_outputs[1]
-    z_log_var = model_outputs[2]
 
-    MSE = tf.reduce_mean(tf.square(y_true - y_pred))
-    KLD = 0.5 * tf.reduce_mean(-1 - z_log_var + tf.square(z_mean) + tf.exp(z_log_var))
 
-    return MSE + beta * KLD
+class VAETrainer:
+    def __init__(self, vae, encoder, decoder, beta=0.4, learning_rate=0.01):
+        self.vae = vae
+        self.encoder = encoder
+        self.decoder = decoder
+        self.beta = beta
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        
+        # Initialize history tracking
+        self.history = {
+            'total_loss': [],
+            'reconstruction_loss': [],
+            'kl_loss': [],
+            'val_total_loss': [],
+            'val_reconstruction_loss': [],
+            'val_kl_loss': []
+        }
+        
+        # Track best model weights
+        self.best_loss = float('inf')
+        self.best_weights = None
+        
+    def compute_losses(self, x):
+        """Compute all components of the loss"""
+        # Ensure input is float32
+        x = tf.cast(x, tf.float32)
+        
+        # Get VAE outputs
+        mean, log_var, z = self.encoder(x)
+        reconstruction = self.decoder(z)
+        
+        # Compute reconstruction loss (MSE)
+        reconstruction_loss = tf.reduce_mean(
+            tf.reduce_sum(tf.square(x - reconstruction), axis=1)
+        )
+        
+        # Compute KL divergence
+        kl_loss = -0.5 * tf.reduce_mean(
+            tf.reduce_sum(1 + log_var - tf.square(mean) - tf.exp(log_var), axis=1)
+        )
+        
+        # Total loss
+        total_loss = reconstruction_loss + self.beta * kl_loss
+        
+        return total_loss, reconstruction_loss, kl_loss
+    
+    @tf.function
+    def train_step(self, x):
+        """Single training step"""
+        with tf.GradientTape() as tape:
+            total_loss, reconstruction_loss, kl_loss = self.compute_losses(x)
+            
+        # Compute gradients
+        trainable_vars = (
+            self.encoder.trainable_variables + 
+            self.decoder.trainable_variables
+        )
+        gradients = tape.gradient(total_loss, trainable_vars)
+        
+        # Apply gradients
+        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
+        
+        return total_loss, reconstruction_loss, kl_loss
+    
+    def train(self, train_dataset, val_dataset, epochs=100, batch_size=128, 
+              stop_patience=8, lr_patience=4, min_delta=1e-4):
+        """Full training loop with early stopping"""
+        # Convert datasets to float32
+        train_dataset = tf.cast(train_dataset, tf.float32)
+        val_dataset = tf.cast(val_dataset, tf.float32)
+        
+        train_ds = tf.data.Dataset.from_tensor_slices(train_dataset).batch(batch_size)
+        val_ds = tf.data.Dataset.from_tensor_slices(val_dataset).batch(batch_size)
+        
+        patience_counter = 0
+        lr_counter = 0
+        
+        for epoch in range(epochs):
+            # Training
+            epoch_losses = {
+                'total_loss': [],
+                'reconstruction_loss': [],
+                'kl_loss': []
+            }
+            
+            for batch in train_ds:
+                total_loss, reconstruction_loss, kl_loss = self.train_step(batch)
+                epoch_losses['total_loss'].append(total_loss)
+                epoch_losses['reconstruction_loss'].append(reconstruction_loss)
+                epoch_losses['kl_loss'].append(kl_loss)
+            
+            # Compute epoch metrics
+            train_total = tf.reduce_mean(epoch_losses['total_loss'])
+            train_reconstruction = tf.reduce_mean(epoch_losses['reconstruction_loss'])
+            train_kl = tf.reduce_mean(epoch_losses['kl_loss'])
+            
+            # Validation
+            val_losses = {
+                'total_loss': [],
+                'reconstruction_loss': [],
+                'kl_loss': []
+            }
+            
+            for batch in val_ds:
+                val_total, val_reconstruction, val_kl = self.compute_losses(batch)
+                val_losses['total_loss'].append(val_total)
+                val_losses['reconstruction_loss'].append(val_reconstruction)
+                val_losses['kl_loss'].append(val_kl)
+            
+            val_total = tf.reduce_mean(val_losses['total_loss'])
+            val_reconstruction = tf.reduce_mean(val_losses['reconstruction_loss'])
+            val_kl = tf.reduce_mean(val_losses['kl_loss'])
+            
+            # Update history
+            self.history['total_loss'].append(float(train_total))
+            self.history['reconstruction_loss'].append(float(train_reconstruction))
+            self.history['kl_loss'].append(float(train_kl))
+            self.history['val_total_loss'].append(float(val_total))
+            self.history['val_reconstruction_loss'].append(float(val_reconstruction))
+            self.history['val_kl_loss'].append(float(val_kl))
+            
+            # Print progress
+            print(f'Epoch {epoch + 1}/{epochs}')
+            print(f'Total Loss: {train_total:.4f} - Reconstruction: {train_reconstruction:.4f} - KL: {train_kl:.4f}')
+            print(f'Val Total Loss: {val_total:.4f} - Val Reconstruction: {val_reconstruction:.4f} - Val KL: {val_kl:.4f}')
+            
+            # Early stopping and learning rate scheduling
+            if val_total < self.best_loss - min_delta:
+                self.best_loss = val_total
+                self.best_weights = [
+                    tf.identity(w) for w in self.vae.get_weights()
+                ]
+                patience_counter = 0
+                lr_counter = 0
+            else:
+                patience_counter += 1
+                lr_counter += 1
+                
+            # Learning rate reduction
+            if lr_counter >= lr_patience:
+                print(f'Learning rate reduced at epoch {epoch + 1}')
+                new_lr = self.optimizer.learning_rate * 0.1
+                self.optimizer.learning_rate.assign(new_lr)
+                lr_counter = 0
+                
+            # Early stopping
+            if patience_counter >= stop_patience:
+                print(f'Early stopping triggered at epoch {epoch + 1}')
+                # Restore best weights
+                self.vae.set_weights(self.best_weights)
+                break
+    
+    def save_model(self, save_path):
+        """Save the VAE components"""
+        self.vae.save_weights(f'{save_path}/vae.weights.h5')
+        self.encoder.save_weights(f'{save_path}/encoder.weights.h5')
+        self.decoder.save_weights(f'{save_path}/decoder.weights.h5')
 
-# Define reconstruction and KL loss to track during training
-def reconstruction_loss(y_true, model_outputs):
-    y_pred = model_outputs[0]  # Get just the reconstruction
-    return tf.reduce_mean(tf.square(y_true - y_pred))
 
-def kl_loss(y_true, model_outputs):
-    z_mean = model_outputs[1]
-    z_log_var = model_outputs[2]
-    return 0.5 * tf.reduce_mean(-1 - z_log_var + tf.square(z_mean) + tf.exp(z_log_var))
+def train_VAE(datasets, h_dim_1, h_dim_2, latent_dim, model_path, l2_reg=0.01, 
+              dropout_rate=0.1, batch_size=128, epochs=100, beta=0.4, 
+              stop_patience=8, lr_patience=4):
+    
+    print('Initializing training procedure... booting up...')
+    
+    # Create the VAE
+    input_dim = datasets['train']['data'].shape[1]
+    vae, encoder, decoder = create_small_VAE(input_dim, h_dim_1, h_dim_2, 
+                                           latent_dim, l2_reg, dropout_rate)
+    
+    # Create trainer
+    trainer = VAETrainer(vae, encoder, decoder, beta=beta)
+    
+    # Train
+    print('Starting training.')
+    trainer.train(
+        datasets['train']['data'],
+        datasets['val']['data'],
+        epochs=epochs,
+        batch_size=batch_size,
+        stop_patience=stop_patience,
+        lr_patience=lr_patience
+    )
+    print('Training complete!')
+    
+    # Save the model
+    print('Saving model...')
+    trainer.save_model(model_path)
+    print('Model saved! Powering down...')
+    
+    return trainer.history
 
-# Saving
-def save_vae(vae, encoder, decoder, save_path):
+# # Loss function for the VAE
+# def loss_fn(y_true, model_outputs, beta=0.5):
+#     y_pred = model_outputs[0]
+#     z_mean = model_outputs[1]
+#     z_log_var = model_outputs[2]
 
-    vae.save_weights(f'{save_path}/vae.weights.h5')
-    encoder.save_weights(f'{save_path}/encoder.weights.h5')
-    decoder.save_weights(f'{save_path}/decoder.weights.h5')
+#     MSE = tf.reduce_mean(tf.square(y_true - y_pred))
+#     KLD = 0.5 * tf.reduce_mean(-1 - z_log_var + tf.square(z_mean) + tf.exp(z_log_var))
+
+#     return MSE + beta * KLD
+
+# # Define reconstruction and KL loss to track during training
+# def reconstruction_loss(y_true, model_outputs):
+#     y_pred = model_outputs[0]  # Get just the reconstruction
+#     return tf.reduce_mean(tf.square(y_true - y_pred))
+
+# def kl_loss(y_true, model_outputs):
+#     z_mean = model_outputs[1]
+#     z_log_var = model_outputs[2]
+#     return 0.5 * tf.reduce_mean(-1 - z_log_var + tf.square(z_mean) + tf.exp(z_log_var))
+
+# # Saving
+# def save_vae(vae, encoder, decoder, save_path):
+
+#     vae.save_weights(f'{save_path}/vae.weights.h5')
+#     encoder.save_weights(f'{save_path}/encoder.weights.h5')
+#     decoder.save_weights(f'{save_path}/decoder.weights.h5')
 
 # Loading
 def load_vae(save_path, input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropout_rate=0.1):
@@ -155,32 +368,32 @@ def load_vae(save_path, input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dr
 
     return vae, encoder, decoder
 
-# Training the VAE
-def train_VAE(datasets, h_dim_1, h_dim_2, latent_dim, model_path, l2_reg=0.01, dropout_rate=0.1, batch_size=128, epochs=100, beta=0.4, stop_patience=8, lr_patience=4):
+# # Training the VAE
+# def train_VAE(datasets, h_dim_1, h_dim_2, latent_dim, model_path, l2_reg=0.01, dropout_rate=0.1, batch_size=128, epochs=100, beta=0.4, stop_patience=8, lr_patience=4):
 
-    print('Initializing training procedure... booting up...')
+#     print('Initializing training procedure... booting up...')
     
-    # Create the VAE
-    input_dim = datasets['train']['data'].shape[1]
-    model, encoder, decoder = create_small_VAE(input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg, dropout_rate)
+#     # Create the VAE
+#     input_dim = datasets['train']['data'].shape[1]
+#     model, encoder, decoder = create_small_VAE(input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg, dropout_rate)
 
-    # Compile
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.01), loss=loss_fn, metrics = [[reconstruction_loss, kl_loss], None, None])
+#     # Compile
+#     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.01), loss=loss_fn, metrics = [[reconstruction_loss, kl_loss], None, None])
 
-    # Define callbacks
-    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=stop_patience, restore_best_weights=True)
-    lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=lr_patience, min_lr=0.00001)
-    callbacks = [early_stopping, lr_scheduler]
+#     # Define callbacks
+#     early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=stop_patience, restore_best_weights=True)
+#     lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=lr_patience, min_lr=0.00001)
+#     callbacks = [early_stopping, lr_scheduler]
 
-    # Train
-    print('Starting training.')
-    history = model.fit(datasets['train']['data'], datasets['train']['data'], batch_size=batch_size, epochs=epochs, validation_data=(datasets['val']['data'], datasets['val']['data']), callbacks=callbacks)
-    print('Training complete! ')
+#     # Train
+#     print('Starting training.')
+#     history = model.fit(datasets['train']['data'], datasets['train']['data'], batch_size=batch_size, epochs=epochs, validation_data=(datasets['val']['data'], datasets['val']['data']), callbacks=callbacks)
+#     print('Training complete! ')
 
-    # Save the model
-    print('Saving model...')
-    save_vae(model, encoder, decoder, model_path)
-    print('Model saved! Powering down...')
+#     # Save the model
+#     print('Saving model...')
+#     save_vae(model, encoder, decoder, model_path)
+#     print('Model saved! Powering down...')
 
 
 # Define different AD score metrics
