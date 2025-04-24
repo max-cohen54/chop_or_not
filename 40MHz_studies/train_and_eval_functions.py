@@ -114,6 +114,7 @@ def create_small_VAE(input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropo
 
     return ae, encoder, decoder
 
+
 def loss_fn(y_true, model_outputs, beta=0.5):
     y_pred = model_outputs[0]
     z_mean = model_outputs[1]
@@ -193,10 +194,14 @@ def MSE_KL_AD_score(y_true, y_pred, z_mean, z_log_var, beta=0.5):
     return MSE_AD_score(y_true, y_pred) + beta * KL_AD_score(z_mean, z_log_var)
 
 
-def create_student_network(input_dim, h_dim, l2_reg=0.01, dropout_rate=0):
+def create_student_network(input_dim, h_dim_1, h_dim_2, l2_reg=0.01, dropout_rate=0):
     
     student_inputs = layers.Input(shape=(input_dim,))
-    x = layers.Dense(h_dim, activation='relu', kernel_regularizer=regularizers.l2(l2_reg))(student_inputs)
+    x = layers.Dense(h_dim_1, activation='relu', kernel_regularizer=regularizers.l2(l2_reg))(student_inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(dropout_rate)(x)
+
+    x = layers.Dense(h_dim_2, activation='relu', kernel_regularizer=regularizers.l2(l2_reg))(x)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(dropout_rate)(x)
     
@@ -210,7 +215,7 @@ def train_student_network(datasets, h_dim, l2_reg=0.01, dropout_rate=0.1, batch_
     
     input_dim = datasets['train']['data'].shape[1]
 
-    student_network = create_student_network(input_dim, h_dim=h_dim, l2_reg=l2_reg, dropout_rate=dropout_rate)
+    student_network = create_student_network(input_dim, h_dim_1, h_dim_2, l2_reg=l2_reg, dropout_rate=dropout_rate)
 
     student_network.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.01), loss='mse')
 
@@ -245,13 +250,14 @@ def plot_student_performance(datasets, plots_path):
     plt.savefig(os.path.join(plots_path, 'student_performance.png'))
     plt.close()
 
-def plot_ROC_curves(datasets, plots_path):
+def plot_ROC_curves(datasets, plots_path, train_student=True):
 
     bkg_MSE_scores = datasets['test']['MSE_AD_scores']
     bkg_KL_scores = datasets['test']['KL_AD_scores']
     bkg_clipped_KL_scores = datasets['test']['clipped_KL_AD_scores']
     bkg_MSE_KL_scores = datasets['test']['MSE_KL_AD_scores']
-    bkg_student_scores = datasets['test']['student_AD_scores']
+    if train_student:
+        bkg_student_scores = datasets['test']['student_AD_scores']
 
     skip_tags = ['train', 'val', 'test']
     for tag, data_dict in datasets.items():
@@ -262,15 +268,21 @@ def plot_ROC_curves(datasets, plots_path):
         sig_KL_scores = data_dict['KL_AD_scores']
         sig_clipped_KL_scores = data_dict['clipped_KL_AD_scores']
         sig_MSE_KL_scores = data_dict['MSE_KL_AD_scores']
-        sig_student_scores = data_dict['student_AD_scores']
+        if train_student:   
+            sig_student_scores = data_dict['student_AD_scores']
+
+        sig_scores_list = [sig_MSE_scores, sig_KL_scores, sig_clipped_KL_scores, sig_MSE_KL_scores]
+        bkg_scores_list = [bkg_MSE_scores, bkg_KL_scores, bkg_clipped_KL_scores, bkg_MSE_KL_scores]
+        score_names_list = ['MSE', 'KL', 'clipped KL', 'MSE + KL']
+        if train_student:
+            sig_scores_list.append(sig_student_scores)
+            bkg_scores_list.append(bkg_student_scores)
+            score_names_list.append('student')
 
         plt.figure(figsize=(15, 8))
         plt.rcParams['axes.linewidth'] = 2.4
 
-        for sig_scores, bkg_scores, score_name in zip([sig_MSE_scores, sig_KL_scores, sig_clipped_KL_scores, sig_MSE_KL_scores, sig_student_scores], 
-                                          [bkg_MSE_scores, bkg_KL_scores, bkg_clipped_KL_scores, bkg_MSE_KL_scores, bkg_student_scores],
-                                          ['MSE', 'KL', 'clipped KL', 'MSE + KL', 'student']):
-            
+        for sig_scores, bkg_scores, score_name in zip(sig_scores_list, bkg_scores_list, score_names_list):
             combined_scores = np.concatenate((bkg_scores, sig_scores), axis=0)
             combined_labels = np.concatenate((np.zeros(len(bkg_scores)), np.ones(len(sig_scores))), axis=0) # 0 = background, 1 = signal
 
@@ -289,7 +301,8 @@ def plot_ROC_curves(datasets, plots_path):
         plt.savefig(os.path.join(plots_path, f'{tag}_ROC_curves.png'))
         plt.close()
 
-def evaluate_VAE(datasets, model_path, plots_path, beta=0.5):
+
+def calculate_AD_scores(datasets, model_path, beta=0.5):
     loaded_vae, loaded_encoder, loaded_decoder = load_vae(model_path)
 
     for tag, data_dict in datasets.items():
@@ -297,20 +310,31 @@ def evaluate_VAE(datasets, model_path, plots_path, beta=0.5):
         print(f'Evaluating {tag} set...')
         y_pred, z_mean, z_log_var = loaded_vae.predict(data_dict['data'])
         
+        data_dict['y_pred'] = y_pred
+        data_dict['z_mean'] = z_mean
+        data_dict['z_log_var'] = z_log_var
         data_dict['MSE_AD_scores'] = MSE_AD_score(data_dict['data'], y_pred)
         data_dict['KL_AD_scores'] = KL_AD_score(z_mean, z_log_var)
         data_dict['clipped_KL_AD_scores'] = clipped_KL_AD_score(z_mean)
         data_dict['MSE_KL_AD_scores'] = MSE_KL_AD_score(data_dict['data'], y_pred, z_mean, z_log_var, beta=beta)
 
-    student_network = train_student_network(datasets, h_dim=32, l2_reg=0.01, dropout_rate=0.1, batch_size=128, epochs=2, stop_patience=8, lr_patience=4)
+    return datasets
 
-    for tag, data_dict in datasets.items():
-        data_dict['student_AD_scores'] = student_network.predict(data_dict['data'])
-
-
-    plot_student_performance(datasets, plots_path)
-    plot_ROC_curves(datasets, plots_path)
-
+def evaluate_VAE(datasets, model_path, plots_path, beta=0.5, train_student=True):
     
+    datasets = calculate_AD_scores(datasets, model_path, beta)
+
+    if train_student:   
+        student_network = train_student_network(datasets, h_dim=32, l2_reg=0.01, dropout_rate=0.1, batch_size=128, epochs=100, stop_patience=8, lr_patience=4)
+    
+        for tag, data_dict in datasets.items():
+            data_dict['student_AD_scores'] = student_network.predict(data_dict['data'])
+
+    if train_student:
+        plot_student_performance(datasets, plots_path)
+
+    plot_ROC_curves(datasets, plots_path, train_student=train_student)
+
+    return datasets
         
     
