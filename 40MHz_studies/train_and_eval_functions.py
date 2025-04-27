@@ -72,22 +72,30 @@ class Sampling(layers.Layer):
     def call(self, inputs):
         z_mean, z_log_var = inputs
         
+        # Instead of clipping, we'll use softer constraints through tf.math.softplus
+        # This ensures log_var doesn't get too extreme while still allowing a wide range
+        z_log_var_stable = tf.clip_by_value(z_log_var, -20.0, 20.0)
+        std = tf.math.sqrt(tf.math.softplus(tf.math.exp(z_log_var_stable)) + 1e-8)
+        
         epsilon = tf.random.normal(shape=tf.shape(z_mean))
-        return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+        return z_mean + std * epsilon
 
         
 # Create a small VAE.
 def create_small_VAE(input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropout_rate=0):
-    # Use a smaller scale for weight initialization
-    #initializer = tf.keras.initializers.HeNormal(seed=42)  # or use smaller variance
-    initializer = tf.keras.initializers.RandomNormal(mean=0., stddev=0.01)
+    # Use He initialization with a smaller scale
+    initializer = tf.keras.initializers.HeNormal(seed=42)
     
     # Encoder
     encoder_inputs = layers.Input(shape=(input_dim,))
+    
+    # Normalize inputs to help with training stability
+    x = layers.BatchNormalization()(encoder_inputs)
+    
     x = layers.Dense(h_dim_1, 
                     activation='relu', 
                     kernel_regularizer=regularizers.l2(l2_reg),
-                    kernel_initializer=initializer)(encoder_inputs)
+                    kernel_initializer=initializer)(x)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(dropout_rate)(x)
     
@@ -98,12 +106,15 @@ def create_small_VAE(input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropo
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(dropout_rate)(x)
     
+    # Let mean and log_var be unconstrained for better AD performance
     z_mean = layers.Dense(latent_dim, 
                          kernel_regularizer=regularizers.l2(l2_reg),
                          kernel_initializer=initializer)(x)
-    z_log_var = layers.Dense(latent_dim, 
+    
+    z_log_var = layers.Dense(latent_dim,
                             kernel_regularizer=regularizers.l2(l2_reg),
                             kernel_initializer=initializer)(x)
+    
     z = Sampling()([z_mean, z_log_var])
     
     encoder = Model(inputs=encoder_inputs, outputs=[z_mean, z_log_var, z])
@@ -139,12 +150,17 @@ def create_small_VAE(input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropo
 
 
 class VAETrainer:
-    def __init__(self, vae, encoder, decoder, beta=0.4, learning_rate=0.01):
+    def __init__(self, vae, encoder, decoder, beta=0.4, n_cycles=4, ratio=0.5):
         self.vae = vae
         self.encoder = encoder
         self.decoder = decoder
-        self.beta = beta
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+        self.max_beta = beta  # Store the maximum beta value
+        self.n_cycles = n_cycles  # Number of cycles for beta annealing
+        self.ratio = ratio  # Ratio of increasing beta phase in each cycle
+        self.current_beta = 0.0  # Initialize current_beta to 0
+        
+        # Use a smaller initial learning rate for better stability
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
         
         # Initialize history tracking
         self.history = {
@@ -153,13 +169,49 @@ class VAETrainer:
             'kl_loss': [],
             'val_total_loss': [],
             'val_reconstruction_loss': [],
-            'val_kl_loss': []
+            'val_kl_loss': [],
+            'beta': [],  # Track beta values
+            'learning_rate': []  # Track learning rates
         }
         
         # Track best model weights
         self.best_loss = float('inf')
         self.best_weights = None
+
+    def get_beta(self, epoch, total_epochs):
+        """Compute beta value for the current epoch using cyclical annealing schedule."""
+        # Calculate the period of one cycle
+        cycle_length = total_epochs // self.n_cycles
         
+        # Calculate current position in the cycle
+        cycle_position = (epoch % cycle_length) / cycle_length
+        
+        # If we're in the increasing phase (determined by ratio)
+        if cycle_position <= self.ratio:
+            # Linear increase from 0 to max_beta
+            beta = self.max_beta * (cycle_position / self.ratio)
+        else:
+            # Constant max_beta in the rest of the cycle
+            beta = self.max_beta
+            
+        return beta
+
+    def get_learning_rate(self, epoch, total_epochs):
+        """Get learning rate based on current cycle."""
+        cycle_length = total_epochs // self.n_cycles
+        current_cycle = epoch // cycle_length
+        
+        # Learning rate schedule:
+        # Cycle 0: 0.01
+        # Cycles 1-2: 0.001
+        # Cycle 3: 0.0001
+        if current_cycle == 0:
+            return 0.01
+        elif current_cycle <= 2:
+            return 0.001
+        else:
+            return 0.0001
+
     def compute_losses(self, x):
         """Compute all components of the loss"""
         # Ensure input is float32
@@ -169,18 +221,37 @@ class VAETrainer:
         mean, log_var, z = self.encoder(x)
         reconstruction = self.decoder(z)
         
+        # Debug: Check components
+        if tf.math.reduce_any(tf.math.is_nan(mean)):
+            print("NaN detected in mean!")
+            print("mean stats:", tf.reduce_min(mean), tf.reduce_max(mean))
+        if tf.math.reduce_any(tf.math.is_nan(log_var)):
+            print("NaN detected in log_var!")
+            print("log_var stats:", tf.reduce_min(log_var), tf.reduce_max(log_var))
+        if tf.math.reduce_any(tf.math.is_nan(z)):
+            print("NaN detected in sampled z!")
+            print("z stats:", tf.reduce_min(z), tf.reduce_max(z))
+        
         # Compute reconstruction loss (MSE)
         reconstruction_loss = tf.reduce_mean(
             tf.reduce_sum(tf.square(x - reconstruction), axis=1)
         )
         
-        # Compute KL divergence
+        # Compute KL divergence with numerical stability
         kl_loss = -0.5 * tf.reduce_mean(
-            tf.reduce_sum(1 + log_var - tf.square(mean) - tf.exp(log_var), axis=1)
+            tf.reduce_sum(
+                1 + tf.clip_by_value(log_var, -20.0, 20.0) - 
+                tf.clip_by_value(tf.square(mean), 0.0, 100.0) - 
+                tf.clip_by_value(tf.exp(log_var), 1e-20, 1e20), 
+                axis=1
+            )
         )
         
-        # Total loss
-        total_loss = reconstruction_loss + self.beta * kl_loss
+        # Get current beta value from the trainer's state
+        current_beta = self.current_beta
+        
+        # Total loss with current beta
+        total_loss = reconstruction_loss + current_beta * kl_loss
         
         return total_loss, reconstruction_loss, kl_loss
     
@@ -197,14 +268,16 @@ class VAETrainer:
         )
         gradients = tape.gradient(total_loss, trainable_vars)
         
+        # Clip gradients by global norm instead of individual norm for better stability
+        gradients, _ = tf.clip_by_global_norm(gradients, clip_norm=5.0)
+        
         # Apply gradients
         self.optimizer.apply_gradients(zip(gradients, trainable_vars))
         
         return total_loss, reconstruction_loss, kl_loss
     
-    def train(self, train_dataset, val_dataset, epochs=100, batch_size=128, 
-              stop_patience=8, lr_patience=4, min_delta=1e-4):
-        """Full training loop with early stopping"""
+    def train(self, train_dataset, val_dataset, epochs=100, batch_size=128):
+        """Full training loop with cyclical beta annealing and fixed learning rate schedule"""
         # Convert datasets to float32
         train_dataset = tf.cast(train_dataset, tf.float32)
         val_dataset = tf.cast(val_dataset, tf.float32)
@@ -212,10 +285,12 @@ class VAETrainer:
         train_ds = tf.data.Dataset.from_tensor_slices(train_dataset).batch(batch_size)
         val_ds = tf.data.Dataset.from_tensor_slices(val_dataset).batch(batch_size)
         
-        patience_counter = 0
-        lr_counter = 0
-        
         for epoch in range(epochs):
+            # Update beta and learning rate for this epoch
+            self.current_beta = self.get_beta(epoch, epochs)
+            current_lr = self.get_learning_rate(epoch, epochs)
+            self.optimizer.learning_rate.assign(current_lr)
+            
             # Training
             epoch_losses = {
                 'total_loss': [],
@@ -223,8 +298,16 @@ class VAETrainer:
                 'kl_loss': []
             }
             
-            for batch in train_ds:
+            for batch_idx, batch in enumerate(train_ds):
                 total_loss, reconstruction_loss, kl_loss = self.train_step(batch)
+                
+                # Check for NaN losses during training
+                if tf.math.is_nan(total_loss) or tf.math.is_nan(reconstruction_loss) or tf.math.is_nan(kl_loss):
+                    print(f"\nNaN detected during training at epoch {epoch + 1}, batch {batch_idx + 1}")
+                    print(f"Beta: {self.current_beta:.4f}, Learning Rate: {current_lr:.6f}")
+                    print(f"Losses - Total: {total_loss:.4f}, Reconstruction: {reconstruction_loss:.4f}, KL: {kl_loss:.4f}")
+                    raise ValueError("NaN losses detected during training")
+                
                 epoch_losses['total_loss'].append(total_loss)
                 epoch_losses['reconstruction_loss'].append(reconstruction_loss)
                 epoch_losses['kl_loss'].append(kl_loss)
@@ -258,38 +341,92 @@ class VAETrainer:
             self.history['val_total_loss'].append(float(val_total))
             self.history['val_reconstruction_loss'].append(float(val_reconstruction))
             self.history['val_kl_loss'].append(float(val_kl))
+            self.history['beta'].append(float(self.current_beta))
+            self.history['learning_rate'].append(float(current_lr))
             
             # Print progress
             print(f'Epoch {epoch + 1}/{epochs}')
+            print(f'Beta: {self.current_beta:.4f}, Learning Rate: {current_lr:.6f}')
             print(f'Total Loss: {train_total:.4f} - Reconstruction: {train_reconstruction:.4f} - KL: {train_kl:.4f}')
             print(f'Val Total Loss: {val_total:.4f} - Val Reconstruction: {val_reconstruction:.4f} - Val KL: {val_kl:.4f}')
             
-            # Early stopping and learning rate scheduling
-            if val_total < self.best_loss - min_delta:
+            # Track best weights (for final model)
+            if val_total < self.best_loss:
                 self.best_loss = val_total
-                self.best_weights = [
-                    tf.identity(w) for w in self.vae.get_weights()
-                ]
-                patience_counter = 0
-                lr_counter = 0
-            else:
-                patience_counter += 1
-                lr_counter += 1
-                
-            # Learning rate reduction
-            if lr_counter >= lr_patience:
-                print(f'Learning rate reduced at epoch {epoch + 1}')
-                new_lr = self.optimizer.learning_rate * 0.1
-                self.optimizer.learning_rate.assign(new_lr)
-                lr_counter = 0
-                
-            # Early stopping
-            if patience_counter >= stop_patience:
-                print(f'Early stopping triggered at epoch {epoch + 1}')
-                # Restore best weights
-                self.vae.set_weights(self.best_weights)
-                break
-    
+                self.best_weights = [tf.identity(w) for w in self.vae.get_weights()]
+        
+        # At the end of training, use the best weights
+        self.vae.set_weights(self.best_weights)
+
+    def plot_history(self, save_path):
+        """Plot and save training history including losses, beta schedule, and learning rate."""
+        # Create the plots directory if it doesn't exist
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+
+        # Set style parameters
+        #plt.style.use('seaborn')
+        colors = ['#2ecc71', '#e74c3c', '#3498db', '#f1c40f', '#9b59b6']
+        
+        # Create figure with 5 subplots (added learning rate plot)
+        plt.figure(figsize=(15, 12))
+        
+        # Total Loss
+        plt.subplot(3, 2, 1)
+        plt.plot(self.history['total_loss'], color=colors[0], label='Train')
+        plt.plot(self.history['val_total_loss'], color=colors[0], linestyle='--', label='Val')
+        plt.title('Total Loss', fontsize=14, pad=10)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Loss', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.3)
+        
+        # Reconstruction Loss
+        plt.subplot(3, 2, 2)
+        plt.plot(self.history['reconstruction_loss'], color=colors[1], label='Train')
+        plt.plot(self.history['val_reconstruction_loss'], color=colors[1], linestyle='--', label='Val')
+        plt.title('Reconstruction Loss', fontsize=14, pad=10)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Loss', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.3)
+        
+        # KL Loss
+        plt.subplot(3, 2, 3)
+        plt.plot(self.history['kl_loss'], color=colors[2], label='Train')
+        plt.plot(self.history['val_kl_loss'], color=colors[2], linestyle='--', label='Val')
+        plt.title('KL Divergence Loss', fontsize=14, pad=10)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Loss', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.3)
+        
+        # Beta Schedule
+        plt.subplot(3, 2, 4)
+        plt.plot(self.history['beta'], color=colors[3], label='Beta')
+        plt.title('Beta Annealing Schedule', fontsize=14, pad=10)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Beta', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.3)
+        
+        # Learning Rate
+        plt.subplot(3, 2, 5)
+        plt.plot(self.history['learning_rate'], color=colors[4], label='Learning Rate')
+        plt.title('Learning Rate Schedule', fontsize=14, pad=10)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Learning Rate', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.3)
+        plt.yscale('log')  # Use log scale for learning rate
+        
+        # Adjust layout and save
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_path, 'training_history.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Training history plots saved to {os.path.join(save_path, 'training_history.png')}")
+
     def save_model(self, save_path):
         """Save the VAE components"""
         self.vae.save_weights(f'{save_path}/vae.weights.h5')
@@ -299,33 +436,64 @@ class VAETrainer:
 
 def train_VAE(datasets, h_dim_1, h_dim_2, latent_dim, model_path, l2_reg=0.01, 
               dropout_rate=0.1, batch_size=128, epochs=100, beta=0.4, 
-              stop_patience=8, lr_patience=4):
+              max_reinit_attempts=10):
     
     print('Initializing training procedure... booting up...')
     
-    # Create the VAE
-    input_dim = datasets['train']['data'].shape[1]
-    vae, encoder, decoder = create_small_VAE(input_dim, h_dim_1, h_dim_2, 
-                                           latent_dim, l2_reg, dropout_rate)
+    def initialize_and_check_network():
+        """Initialize network and check if initial losses are valid"""
+        # Create the VAE
+        input_dim = datasets['train']['data'].shape[1]
+        vae, encoder, decoder = create_small_VAE(input_dim, h_dim_1, h_dim_2, 
+                                               latent_dim, l2_reg, dropout_rate)
+        
+        # Create trainer
+        trainer = VAETrainer(vae, encoder, decoder, beta=beta, n_cycles=4, ratio=0.5)
+        
+        # Get initial losses on a batch of data
+        initial_data = datasets['train']['data'][:batch_size]
+        total_loss, reconstruction_loss, kl_loss = trainer.compute_losses(initial_data)
+        
+        # Check if any loss is NaN
+        if tf.math.is_nan(total_loss) or tf.math.is_nan(reconstruction_loss) or tf.math.is_nan(kl_loss):
+            return None, None, None, True
+        
+        return vae, encoder, decoder, False
+
+    # Try initializing the network until we get valid initial losses
+    attempt = 0
+    while attempt < max_reinit_attempts:
+        print(f'\nInitialization attempt {attempt + 1}/{max_reinit_attempts}')
+        vae, encoder, decoder, has_nan = initialize_and_check_network()
+        
+        if not has_nan:
+            print('Successfully initialized network with valid losses!')
+            break
+        
+        print('Detected NaN losses, reinitializing network...')
+        attempt += 1
+        
+        if attempt == max_reinit_attempts:
+            raise ValueError(f'Failed to initialize network with valid losses after {max_reinit_attempts} attempts')
     
-    # Create trainer
-    trainer = VAETrainer(vae, encoder, decoder, beta=beta)
+    # Create trainer with the successful initialization
+    trainer = VAETrainer(vae, encoder, decoder, beta=beta, n_cycles=4, ratio=0.5)
     
     # Train
-    print('Starting training.')
+    print('\nStarting training.')
     trainer.train(
         datasets['train']['data'],
         datasets['val']['data'],
         epochs=epochs,
-        batch_size=batch_size,
-        stop_patience=stop_patience,
-        lr_patience=lr_patience
+        batch_size=batch_size
     )
     print('Training complete!')
     
     # Save the model
     print('Saving model...')
     trainer.save_model(model_path)
+    # Plot training history
+    trainer.plot_history(model_path)
     print('Model saved! Powering down...')
     
     return trainer.history
