@@ -10,6 +10,14 @@ import tensorflow as tf
 from tensorflow.keras.models import load_model
 from sklearn.metrics import roc_curve, auc
 
+# Try to import XGBoost, but don't fail if it's not available
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+    print("XGBoost not available. Only neural network student will be used.")
+
 
 def load_and_preprocess(data_path, standard_scaler=True):
 
@@ -111,7 +119,7 @@ def create_small_VAE(input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropo
                          kernel_regularizer=regularizers.l2(l2_reg),
                          kernel_initializer=initializer)(x)
     
-    z_log_var = layers.Dense(latent_dim,
+    z_log_var = layers.Dense(latent_dim, 
                             kernel_regularizer=regularizers.l2(l2_reg),
                             kernel_initializer=initializer)(x)
     
@@ -150,17 +158,44 @@ def create_small_VAE(input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropo
 
 
 class VAETrainer:
-    def __init__(self, vae, encoder, decoder, beta=0.4, n_cycles=4, ratio=0.5):
+    def __init__(self, vae, encoder, decoder, beta=0.4, annealing_type='cyclical', 
+                 # Cyclical annealing parameters
+                 n_cycles=4, ratio=0.5,
+                 # Standard annealing parameters
+                 warmup_epochs=None, increase_epochs=None,
+                 # Learning rate parameters
+                 learning_rates=None, stage_lengths=None):
         self.vae = vae
         self.encoder = encoder
         self.decoder = decoder
         self.max_beta = beta  # Store the maximum beta value
-        self.n_cycles = n_cycles  # Number of cycles for beta annealing
+        self.annealing_type = annealing_type  # 'cyclical' or 'standard'
+        
+        # Cyclical annealing parameters
+        self.n_cycles = n_cycles  # Number of cycles for cyclical annealing
         self.ratio = ratio  # Ratio of increasing beta phase in each cycle
+        
+        # Standard annealing parameters
+        if annealing_type == 'standard':
+            if warmup_epochs is None or increase_epochs is None:
+                raise ValueError("warmup_epochs and increase_epochs must be specified for standard annealing")
+            self.warmup_epochs = warmup_epochs
+            self.increase_epochs = increase_epochs
+        
+        # Learning rate parameters
+        if learning_rates is None or stage_lengths is None:
+            raise ValueError("Both learning_rates and stage_lengths must be provided")
+        if len(learning_rates) != len(stage_lengths):
+            raise ValueError("learning_rates and stage_lengths must have the same length")
+            
+        self.learning_rates = np.array(learning_rates)
+        self.stage_lengths = np.array(stage_lengths)
+        self.stage_boundaries = np.cumsum(self.stage_lengths)
+        
         self.current_beta = 0.0  # Initialize current_beta to 0
         
-        # Use a smaller initial learning rate for better stability
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
+        # Initialize optimizer with first learning rate
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rates[0])
         
         # Initialize history tracking
         self.history = {
@@ -177,40 +212,43 @@ class VAETrainer:
         # Track best model weights
         self.best_loss = float('inf')
         self.best_weights = None
-
+        
     def get_beta(self, epoch, total_epochs):
-        """Compute beta value for the current epoch using cyclical annealing schedule."""
-        # Calculate the period of one cycle
-        cycle_length = total_epochs // self.n_cycles
-        
-        # Calculate current position in the cycle
-        cycle_position = (epoch % cycle_length) / cycle_length
-        
-        # If we're in the increasing phase (determined by ratio)
-        if cycle_position <= self.ratio:
-            # Linear increase from 0 to max_beta
-            beta = self.max_beta * (cycle_position / self.ratio)
-        else:
-            # Constant max_beta in the rest of the cycle
-            beta = self.max_beta
+        """Compute beta value for the current epoch using either cyclical or standard annealing schedule."""
+        if self.annealing_type == 'cyclical':
+            # Calculate the period of one cycle
+            cycle_length = total_epochs // self.n_cycles
             
+            # Calculate current position in the cycle
+            cycle_position = (epoch % cycle_length) / cycle_length
+            
+            # If we're in the increasing phase (determined by ratio)
+            if cycle_position <= self.ratio:
+                # Linear increase from 0 to max_beta
+                beta = self.max_beta * (cycle_position / self.ratio)
+            else:
+                # Constant max_beta in the rest of the cycle
+                beta = self.max_beta
+        
+        else:  # standard annealing with three phases
+            if epoch < self.warmup_epochs:
+                # Phase 1: Warmup - beta is 0
+                beta = 0.0
+            elif epoch < self.warmup_epochs + self.increase_epochs:
+                # Phase 2: Linear increase
+                current_position = epoch - self.warmup_epochs
+                beta = self.max_beta * (current_position / self.increase_epochs)
+            else:
+                # Phase 3: Constant maximum
+                beta = self.max_beta
+        
         return beta
 
     def get_learning_rate(self, epoch, total_epochs):
-        """Get learning rate based on current cycle."""
-        cycle_length = total_epochs // self.n_cycles
-        current_cycle = epoch // cycle_length
-        
-        # Learning rate schedule:
-        # Cycle 0: 0.01
-        # Cycles 1-2: 0.001
-        # Cycle 3: 0.0001
-        if current_cycle == 0:
-            return 0.01
-        elif current_cycle <= 2:
-            return 0.001
-        else:
-            return 0.0001
+        """Get learning rate for the current epoch using custom stage schedule."""
+        # Find the stage for the current epoch
+        stage_idx = np.searchsorted(self.stage_boundaries, epoch, side='right')
+        return self.learning_rates[stage_idx]
 
     def compute_losses(self, x):
         """Compute all components of the loss"""
@@ -277,7 +315,7 @@ class VAETrainer:
         return total_loss, reconstruction_loss, kl_loss
     
     def train(self, train_dataset, val_dataset, epochs=100, batch_size=128):
-        """Full training loop with cyclical beta annealing and fixed learning rate schedule"""
+        """Full training loop with beta annealing and learning rate scheduling"""
         # Convert datasets to float32
         train_dataset = tf.cast(train_dataset, tf.float32)
         val_dataset = tf.cast(val_dataset, tf.float32)
@@ -426,7 +464,7 @@ class VAETrainer:
         plt.close()
         
         print(f"Training history plots saved to {os.path.join(save_path, 'training_history.png')}")
-
+    
     def save_model(self, save_path):
         """Save the VAE components"""
         self.vae.save_weights(f'{save_path}/vae.weights.h5')
@@ -436,9 +474,45 @@ class VAETrainer:
 
 def train_VAE(datasets, h_dim_1, h_dim_2, latent_dim, model_path, l2_reg=0.01, 
               dropout_rate=0.1, batch_size=128, epochs=100, beta=0.4, 
-              max_reinit_attempts=10):
+              max_reinit_attempts=10, annealing_type='cyclical', 
+              # Cyclical annealing parameters
+              n_cycles=4, ratio=0.5,
+              # Standard annealing parameters
+              warmup_epochs=None, increase_epochs=None,
+              # Learning rate parameters
+              learning_rates=None, stage_lengths=None):
+    
+    # Validate learning rate parameters
+    if learning_rates is None or stage_lengths is None:
+        raise ValueError("Both learning_rates and stage_lengths must be provided")
+    if len(learning_rates) != len(stage_lengths):
+        raise ValueError("learning_rates and stage_lengths must have the same length")
+    if sum(stage_lengths) != epochs:
+        raise ValueError(f"Sum of stage_lengths ({sum(stage_lengths)}) must equal total epochs ({epochs})")
     
     print('Initializing training procedure... booting up...')
+    print(f'Using {annealing_type} beta annealing schedule')
+    if annealing_type == 'cyclical':
+        print(f'Number of cycles: {n_cycles}, Ratio: {ratio}')
+    else:
+        constant_epochs = epochs - warmup_epochs - increase_epochs
+        print(f'Standard schedule phases:')
+        print(f'  - Warmup (β=0): {warmup_epochs} epochs')
+        print(f'  - Increase (β=0→{beta}): {increase_epochs} epochs')
+        print(f'  - Constant (β={beta}): {constant_epochs} epochs')
+        if constant_epochs < 0:
+            raise ValueError(
+                f'Invalid schedule: total epochs ({epochs}) must be greater than '
+                f'warmup ({warmup_epochs}) + increase ({increase_epochs}) epochs'
+            )
+    
+    # Print learning rate schedule
+    print(f'\nLearning rate schedule ({len(learning_rates)} stages):')
+    current_epoch = 0
+    for i, (lr, length) in enumerate(zip(learning_rates, stage_lengths)):
+        end_epoch = current_epoch + length - 1
+        print(f'  - Stage {i+1}: epochs {current_epoch:3d}-{end_epoch:3d}, lr = {lr:.6f}')
+        current_epoch += length
     
     def initialize_and_check_network():
         """Initialize network and check if initial losses are valid"""
@@ -448,7 +522,17 @@ def train_VAE(datasets, h_dim_1, h_dim_2, latent_dim, model_path, l2_reg=0.01,
                                                latent_dim, l2_reg, dropout_rate)
         
         # Create trainer
-        trainer = VAETrainer(vae, encoder, decoder, beta=beta, n_cycles=4, ratio=0.5)
+        trainer = VAETrainer(
+            vae, encoder, decoder, 
+            beta=beta,
+            annealing_type=annealing_type,
+            n_cycles=n_cycles,
+            ratio=ratio,
+            warmup_epochs=warmup_epochs,
+            increase_epochs=increase_epochs,
+            learning_rates=learning_rates,
+            stage_lengths=stage_lengths
+        )
         
         # Get initial losses on a batch of data
         initial_data = datasets['train']['data'][:batch_size]
@@ -477,7 +561,17 @@ def train_VAE(datasets, h_dim_1, h_dim_2, latent_dim, model_path, l2_reg=0.01,
             raise ValueError(f'Failed to initialize network with valid losses after {max_reinit_attempts} attempts')
     
     # Create trainer with the successful initialization
-    trainer = VAETrainer(vae, encoder, decoder, beta=beta, n_cycles=4, ratio=0.5)
+    trainer = VAETrainer(
+        vae, encoder, decoder, 
+        beta=beta,
+        annealing_type=annealing_type,
+        n_cycles=n_cycles,
+        ratio=ratio,
+        warmup_epochs=warmup_epochs,
+        increase_epochs=increase_epochs,
+        learning_rates=learning_rates,
+        stage_lengths=stage_lengths
+    )
     
     # Train
     print('\nStarting training.')
@@ -595,73 +689,134 @@ def create_student_network(input_dim, h_dim_1, h_dim_2, l2_reg=0.01, dropout_rat
 
     return student_network
 
-# Training the student network
-def train_student_network(datasets, save_path, h_dim_1, h_dim_2, l2_reg=0.01, dropout_rate=0.1, batch_size=128, epochs=100, stop_patience=8, lr_patience=4):
+def create_xgb_student():
+    """Create an XGBoost student model for anomaly detection."""
+    if not XGBOOST_AVAILABLE:
+        raise ImportError("XGBoost is not available in the current environment")
+    
+    return xgb.XGBRegressor(
+        n_estimators=100,
+        max_depth=5,
+        learning_rate=0.1,
+        objective='reg:squarederror',
+        tree_method='hist',  # For faster training
+        random_state=42
+    )
 
+# Training the student networks
+def train_student_networks(datasets, save_path, h_dim_1, h_dim_2, l2_reg=0.01, dropout_rate=0.1, batch_size=128, epochs=100, stop_patience=8, lr_patience=4):
     print('Initializing knowledge distillation procedure...')
     
-    # Create the student network
-    print('Creating student network...')
+    # Create the neural network student
+    print('Creating neural network student...')
     input_dim = datasets['train']['data'].shape[1]
-    student_network = create_student_network(input_dim, h_dim_1, h_dim_2, l2_reg=l2_reg, dropout_rate=dropout_rate)
+    nn_student = create_student_network(input_dim, h_dim_1, h_dim_2, l2_reg=l2_reg, dropout_rate=dropout_rate)
 
-    # Compile
-    student_network.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.01), loss='mse')
+    # Create the XGBoost student if available
+    xgb_student = None
+    if XGBOOST_AVAILABLE:
+        print('Creating XGBoost student...')
+        xgb_student = create_xgb_student()
 
-    # Define callbacks
+    # Compile neural network student
+    nn_student.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.01), loss='mse')
+
+    # Define callbacks for neural network
     early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=stop_patience, restore_best_weights=True)
     lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=lr_patience, min_lr=0.00001)
     callbacks = [early_stopping, lr_scheduler]
 
-    # Train
-    print('Starting training of the student network.')
-    history = student_network.fit(datasets['train']['data'], datasets['train']['MSE_KL_AD_scores'], batch_size=batch_size, epochs=epochs, validation_data=(datasets['val']['data'], datasets['val']['MSE_KL_AD_scores']), callbacks=callbacks)
-    
-    # Save the model
-    print('Saving student network...')
-    student_network.save_weights(f'{save_path}/student.weights.h5')
-    print('Student network saved! Knowledge distillation complete.')
+    # Train neural network student
+    print('Starting training of the neural network student.')
+    nn_history = nn_student.fit(
+        datasets['train']['data'], 
+        datasets['train']['MSE_KL_AD_scores'],
+        batch_size=batch_size,
+        epochs=epochs,
+        validation_data=(datasets['val']['data'], datasets['val']['MSE_KL_AD_scores']),
+        callbacks=callbacks
+    )
 
-    return student_network
+    # Train XGBoost student if available
+    if XGBOOST_AVAILABLE and xgb_student is not None:
+        print('Starting training of the XGBoost student.')
+        xgb_student.fit(
+            datasets['train']['data'],
+            datasets['train']['MSE_KL_AD_scores'],
+            eval_set=[(datasets['val']['data'], datasets['val']['MSE_KL_AD_scores'])],
+            early_stopping_rounds=20,
+            verbose=True
+        )
 
-# Plotting a scatter plot of true AD scores vs student predicted AD scores
+    # Save the models
+    print('Saving student networks...')
+    nn_student.save_weights(f'{save_path}/nn_student.weights.h5')
+    if XGBOOST_AVAILABLE and xgb_student is not None:
+        xgb_student.save_model(f'{save_path}/xgb_student.json')
+    print('Student networks saved! Knowledge distillation complete.')
+
+    return nn_student, xgb_student
+
 def plot_student_performance(datasets, plots_path):
-    plt.figure(figsize=(15, 8))
+    """Plot scatter plots comparing true AD scores vs predicted scores for both students."""
+    if XGBOOST_AVAILABLE:
+        fig_size = (20, 8)
+        n_plots = 2
+    else:
+        fig_size = (10, 8)
+        n_plots = 1
+        
+    plt.figure(figsize=fig_size)
     plt.rcParams['axes.linewidth'] = 2.4
 
-
+    # Neural Network Student Plot
+    if XGBOOST_AVAILABLE:
+        plt.subplot(1, 2, 1)
     skip_tags = ['train', 'val']
     for tag, data_dict in datasets.items():
         if tag in skip_tags:
             continue
+        plt.scatter(data_dict['MSE_KL_AD_scores'], data_dict['nn_student_AD_scores'], label=f'{tag}', alpha=0.6)
 
-        plt.scatter(data_dict['MSE_KL_AD_scores'], data_dict['student_AD_scores'], label=f'{tag}')
-
-
-    # Plot diagonal line
     min_val = min(plt.xlim()[0], plt.ylim()[0])
     max_val = max(plt.xlim()[1], plt.ylim()[1])
     plt.plot([min_val, max_val], [min_val, max_val], '--', color='grey', label='Perfect Performance')
-    
-    # Aesthetics
     plt.xlabel('MSE + KL', fontsize=20)
-    plt.ylabel('Student', fontsize=20)
-    plt.legend(loc='lower right', fontsize=20)
+    plt.ylabel('Neural Network Student', fontsize=20)
+    plt.legend(loc='lower right', fontsize=15)
+    plt.title('Neural Network Student Performance', fontsize=20)
+
+    # XGBoost Student Plot if available
+    if XGBOOST_AVAILABLE:
+        plt.subplot(1, 2, 2)
+        for tag, data_dict in datasets.items():
+            if tag in skip_tags:
+                continue
+            plt.scatter(data_dict['MSE_KL_AD_scores'], data_dict['xgb_student_AD_scores'], label=f'{tag}', alpha=0.6)
+
+        min_val = min(plt.xlim()[0], plt.ylim()[0])
+        max_val = max(plt.xlim()[1], plt.ylim()[1])
+        plt.plot([min_val, max_val], [min_val, max_val], '--', color='grey', label='Perfect Performance')
+        plt.xlabel('MSE + KL', fontsize=20)
+        plt.ylabel('XGBoost Student', fontsize=20)
+        plt.legend(loc='lower right', fontsize=15)
+        plt.title('XGBoost Student Performance', fontsize=20)
 
     # Save
+    plt.tight_layout()
     plt.savefig(os.path.join(plots_path, 'student_performance.png'))
     plt.close()
 
-# Plotting ROC curves. Different plots for each signal, each plot as ROC curves for each AD score metric.
-def plot_ROC_curves(datasets, plots_path, use_student=True):
-
-    # Get the test set scores for each AD score metric. These are treated as background scores.
+def plot_ROC_curves(datasets, plots_path, use_students=True):
+    # Get the test set scores for each AD score metric
     bkg_MSE_scores = datasets['test']['MSE_AD_scores']
     bkg_KL_scores = datasets['test']['KL_AD_scores']
     bkg_clipped_KL_scores = datasets['test']['clipped_KL_AD_scores']
     bkg_MSE_KL_scores = datasets['test']['MSE_KL_AD_scores']
-    if use_student:
-        bkg_student_scores = datasets['test']['student_AD_scores']
+    if use_students:
+        bkg_nn_student_scores = datasets['test']['nn_student_AD_scores']
+        if XGBOOST_AVAILABLE and 'xgb_student_AD_scores' in datasets['test']:
+            bkg_xgb_student_scores = datasets['test']['xgb_student_AD_scores']
 
     # Loop over the signals
     skip_tags = ['train', 'val', 'test']
@@ -674,17 +829,23 @@ def plot_ROC_curves(datasets, plots_path, use_student=True):
         sig_KL_scores = data_dict['KL_AD_scores']
         sig_clipped_KL_scores = data_dict['clipped_KL_AD_scores']
         sig_MSE_KL_scores = data_dict['MSE_KL_AD_scores']
-        if use_student:   
-            sig_student_scores = data_dict['student_AD_scores']
+        if use_students:
+            sig_nn_student_scores = data_dict['nn_student_AD_scores']
+            if XGBOOST_AVAILABLE and 'xgb_student_AD_scores' in data_dict:
+                sig_xgb_student_scores = data_dict['xgb_student_AD_scores']
 
         # Create lists of scores and score names
         sig_scores_list = [sig_MSE_scores, sig_KL_scores, sig_clipped_KL_scores, sig_MSE_KL_scores]
         bkg_scores_list = [bkg_MSE_scores, bkg_KL_scores, bkg_clipped_KL_scores, bkg_MSE_KL_scores]
         score_names_list = ['MSE', 'KL', 'clipped KL', 'MSE + KL']
-        if use_student:
-            sig_scores_list.append(sig_student_scores)
-            bkg_scores_list.append(bkg_student_scores)
-            score_names_list.append('student')
+        if use_students:
+            sig_scores_list.append(sig_nn_student_scores)
+            bkg_scores_list.append(bkg_nn_student_scores)
+            score_names_list.append('NN Student')
+            if XGBOOST_AVAILABLE and 'xgb_student_AD_scores' in data_dict:
+                sig_scores_list.append(sig_xgb_student_scores)
+                bkg_scores_list.append(bkg_xgb_student_scores)
+                score_names_list.append('XGB Student')
 
         # Initialize the plot
         plt.figure(figsize=(15, 8))
@@ -692,23 +853,22 @@ def plot_ROC_curves(datasets, plots_path, use_student=True):
 
         # Loop over each set of scores and score names
         for sig_scores, bkg_scores, score_name in zip(sig_scores_list, bkg_scores_list, score_names_list):
-
-            # Create combined scores and labels -- background scores are 0, signal scores are 1
+            # Create combined scores and labels
             combined_scores = np.concatenate((bkg_scores, sig_scores), axis=0)
             combined_labels = np.concatenate((np.zeros(len(bkg_scores)), np.ones(len(sig_scores))), axis=0)
 
-            # Calculate the ROC curve using sklearn
+            # Calculate the ROC curve
             FPRs, TPRs, thresholds = roc_curve(y_true=combined_labels, y_score=combined_scores)
             AUC = auc(FPRs, TPRs)
 
             # Plot the ROC curve
             plt.plot(FPRs, TPRs, label=f'{tag} {score_name} (AUC = {AUC:.2f})')
 
-        # Plot the diagonal line for the random classifier
+        # Plot the diagonal line
         plt.plot([0, 1], [0, 1], '--', color='grey', label='Random Classifier')
 
         # Aesthetics
-        plt.legend(loc='lower right', fontsize=20)
+        plt.legend(loc='lower right', fontsize=15)
         plt.xlabel('False Positive Rate', fontsize=20)
         plt.ylabel('True Positive Rate', fontsize=20)
         plt.yscale('log')
@@ -720,7 +880,50 @@ def plot_ROC_curves(datasets, plots_path, use_student=True):
         plt.savefig(os.path.join(plots_path, f'{tag}_ROC_curves.png'))
         plt.close()
 
-# Run inference on the VAE and calculate the AD scores for each dataset
+def evaluate_VAE(datasets, model_path, plots_path, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropout_rate=0.1, beta=0.5, train_students=False, load_students=True):
+    print('Beginning evaluation procedure... booting up...')
+    
+    # Calculate the AD scores for each dataset
+    print('Calculating AD scores for each dataset...')
+    datasets = calculate_AD_scores(datasets, model_path, h_dim_1, h_dim_2, latent_dim, l2_reg, dropout_rate, beta)
+
+    input_dim = datasets['train']['data'].shape[1]
+
+    # Train or load the student networks
+    if train_students:   
+        print('Training student networks...')
+        nn_student, xgb_student = train_student_networks(datasets, model_path, h_dim_1, h_dim_2)
+    elif load_students:
+        print('Loading student networks...')
+        # Load neural network student
+        nn_student = create_student_network(input_dim, h_dim_1, h_dim_2, l2_reg=l2_reg, dropout_rate=dropout_rate)
+        nn_student.load_weights(f'{model_path}/nn_student.weights.h5')
+        
+        # Load XGBoost student if available
+        xgb_student = None
+        if XGBOOST_AVAILABLE and os.path.exists(f'{model_path}/xgb_student.json'):
+            xgb_student = create_xgb_student()
+            xgb_student.load_model(f'{model_path}/xgb_student.json')
+        print('Student networks loaded!')
+
+    # Run inference on the student networks
+    if train_students or load_students:
+        print('Running inference on the student networks...')
+        for tag, data_dict in datasets.items():
+            data_dict['nn_student_AD_scores'] = nn_student.predict(data_dict['data'])
+            if XGBOOST_AVAILABLE and xgb_student is not None:
+                data_dict['xgb_student_AD_scores'] = xgb_student.predict(data_dict['data'])
+        print('Inference complete! Plotting student performance...')
+        plot_student_performance(datasets, plots_path)
+
+    # Plot the ROC curves
+    print('Plotting ROC curves...')
+    use_students = train_students or load_students
+    plot_ROC_curves(datasets, plots_path, use_students=use_students)
+    print('ROC curves plotted! Evaluation complete.')
+
+    return datasets
+
 def calculate_AD_scores(datasets, model_path, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropout_rate=0.1, beta=0.5):
     
     # Load the VAE
@@ -745,44 +948,6 @@ def calculate_AD_scores(datasets, model_path, h_dim_1, h_dim_2, latent_dim, l2_r
         data_dict['KL_AD_scores'] = KL_AD_score(z_mean, z_log_var)
         data_dict['clipped_KL_AD_scores'] = clipped_KL_AD_score(z_mean)
         data_dict['MSE_KL_AD_scores'] = MSE_KL_AD_score(data_dict['data'], y_pred, z_mean, z_log_var, beta=beta)
-
-    return datasets
-
-def evaluate_VAE(datasets, model_path, plots_path, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropout_rate=0.1, beta=0.5, train_student=False, load_student=True):
-
-    print('Beginning evaluation procedure... booting up...')
-    
-    # Calculate the AD scores for each dataset
-    print('Calculating AD scores for each dataset...')
-    datasets = calculate_AD_scores(datasets, model_path, h_dim_1, h_dim_2, latent_dim, l2_reg, dropout_rate, beta)
-
-    # Train the student network if specified
-    if train_student:   
-        print('Training student network...')
-        student_network = train_student_network(datasets, model_path, h_dim_1, h_dim_2, l2_reg=0.01, dropout_rate=0.1, batch_size=128, epochs=100, stop_patience=8, lr_patience=4)
-
-    # Load the student network if specified
-    if load_student:
-        print('Loading student network...')
-        input_dim = datasets['train']['data'].shape[1]
-
-        student_network = create_student_network(input_dim, h_dim_1, h_dim_2, l2_reg=l2_reg, dropout_rate=dropout_rate)
-        student_network.load_weights(f'{model_path}/student.weights.h5')
-        print('Student network loaded!')
-
-    # Run inference on the student network and plot performance if specified
-    if train_student or load_student:
-        print('Running inference on the student network...')
-        for tag, data_dict in datasets.items():
-            data_dict['student_AD_scores'] = student_network.predict(data_dict['data'])
-        print('Inference complete! Plotting student performance...')
-        plot_student_performance(datasets, plots_path)
-
-    # Plot the ROC curves
-    print('Plotting ROC curves...')
-    use_student = train_student or load_student
-    plot_ROC_curves(datasets, plots_path, use_student=use_student)
-    print('ROC curves plotted! Evaluation complete.')
 
     return datasets
         
