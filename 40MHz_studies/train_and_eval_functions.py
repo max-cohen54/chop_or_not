@@ -19,11 +19,147 @@ except ImportError:
     print("XGBoost not available. Only neural network student will be used.")
 
 
-def load_and_preprocess(data_path, standard_scaler=True):
+def load_subdicts_from_h5(save_dir):
+    main_dict = {}
+    
+    for filename in os.listdir(save_dir):
+        if filename.endswith(".h5") and not filename.startswith('.'):
 
+            # Make sure it's a file (not directory!)
+            if not os.path.isfile(file_path):
+                continue
+
+            
+            sub_dict_name = os.path.splitext(filename)[0]
+            file_path = os.path.join(save_dir, filename)
+            with h5py.File(file_path, 'r') as f:
+                sub_dict = {key: np.array(f[key]) for key in f}
+            main_dict[sub_dict_name] = sub_dict
+            print(f"Loaded {sub_dict_name} from {file_path}")
+    
+    return main_dict
+
+
+def save_subdicts_to_h5(main_dict, save_dir):
+    os.makedirs(save_dir, exist_ok=True)
+    
+    for sub_dict_name, sub_dict in main_dict.items():
+        file_path = os.path.join(save_dir, f"{sub_dict_name}.h5")
+        with h5py.File(file_path, 'w') as f:
+            for key, arr in sub_dict.items():
+                f.create_dataset(key, data=arr)
+        print(f"Saved {sub_dict_name} to {file_path}")
+
+
+class ZeroAwareStandardScaler:
+    """A StandardScaler that preserves zero values in the data."""
+    
+    def __init__(self):
+        self.mean_ = None
+        self.scale_ = None
+        self.n_features_ = None
+    
+    def fit(self, X):
+        """Compute the mean and scale of the non-zero values for each feature.
+        
+        Parameters:
+        -----------
+        X : array-like of shape (n_samples, n_features)
+            The data used to compute the mean and standard deviation
+        """
+        X = np.array(X)
+        self.n_features_ = X.shape[1]
+        
+        # Create masks for non-zero values
+        non_zero_mask = (X != 0)
+        
+        # Initialize statistics arrays
+        self.mean_ = np.zeros(self.n_features_)
+        self.scale_ = np.ones(self.n_features_)
+        
+        # Compute mean and std for each feature using only non-zero values
+        for j in range(self.n_features_):
+            non_zero_values = X[non_zero_mask[:, j], j]
+            if len(non_zero_values) > 0:  # Only compute if we have non-zero values
+                self.mean_[j] = np.mean(non_zero_values)
+                self.scale_[j] = np.std(non_zero_values)
+                if self.scale_[j] == 0:
+                    self.scale_[j] = 1.0
+        
+        return self
+    
+    def transform(self, X):
+        """Standardize the data, preserving zeros.
+        
+        Parameters:
+        -----------
+        X : array-like of shape (n_samples, n_features)
+            The data to standardize
+        """
+        X = np.array(X)
+        if X.shape[1] != self.n_features_:
+            raise ValueError("Number of features in transform does not match fit")
+        
+        # Create a copy of the input data
+        X_scaled = X.copy()
+        
+        # Create mask for non-zero values
+        non_zero_mask = (X != 0)
+        
+        # Scale only non-zero values
+        for j in range(self.n_features_):
+            X_scaled[non_zero_mask[:, j], j] = (
+                (X[non_zero_mask[:, j], j] - self.mean_[j]) / self.scale_[j]
+            )
+        
+        return X_scaled
+    
+    def fit_transform(self, X):
+        """Fit to data, then transform it."""
+        return self.fit(X).transform(X)
+
+    def inverse_transform(self, X):
+        """Scale back the data to the original representation, preserving zeros.
+        
+        Parameters:
+        -----------
+        X : array-like of shape (n_samples, n_features)
+            The data to inverse transform
+        """
+        X = np.array(X)
+        if X.shape[1] != self.n_features_:
+            raise ValueError("Number of features in inverse_transform does not match fit")
+        
+        # Create a copy of the input data
+        X_scaled = X.copy()
+        
+        # Create mask for non-zero values
+        non_zero_mask = (X != 0)
+        
+        # Inverse scale only non-zero values
+        for j in range(self.n_features_):
+            X_scaled[non_zero_mask[:, j], j] = (
+                X[non_zero_mask[:, j], j] * self.scale_[j] + self.mean_[j]
+            )
+        
+        return X_scaled
+
+def load_and_preprocess(data_path, standard_scaler=True, zero_aware_scaling=False):
+    """
+    Load and preprocess the data.
+    
+    Parameters:
+    -----------
+    data_path : str
+        Path to the directory containing the data files
+    standard_scaler : bool, default=True
+        Whether to apply scaling to the data
+    zero_aware_scaling : bool, default=False
+        If True and standard_scaler is True, use ZeroAwareStandardScaler instead of StandardScaler
+    """
     print('Booting up...\nStarting to load data...\n')
 
-    # Initialize empty dictionary to store the datasets. This will be a dictionary of dictionaries, one for each dataset
+    # Initialize empty dictionary to store the datasets
     datasets = {}
 
     # Load the data from the hdf5 files
@@ -42,7 +178,6 @@ def load_and_preprocess(data_path, standard_scaler=True):
             
             datasets[dataset_name] = {'data': file['Particles'][:, :, :-1]} # remove the 'obj_type' feature
 
-
     print('Beginning preprocessing...\n')
 
     # Split the data into training, validation, and test sets
@@ -55,22 +190,25 @@ def load_and_preprocess(data_path, standard_scaler=True):
     datasets['test'] = {key: value[test_idxs] for key, value in datasets['background'].items()}
     del datasets['background']
 
-
-    # flatten the data, and apply standard scaler if specified
+    # flatten the data
     for tag, data_dict in datasets.items():
         num_features = np.prod(data_dict['data'].shape[-2:])
         data_dict['data'] = data_dict['data'].reshape(-1, num_features)
 
-
-    # Fit and apply the standard scaler to the training data
+    # Apply scaling if specified
     if standard_scaler:
-        scaler = StandardScaler()
+        if zero_aware_scaling:
+            print('Using zero-aware standard scaling...')
+            scaler = ZeroAwareStandardScaler()
+        else:
+            print('Using standard scaling...')
+            scaler = StandardScaler()
+            
         scaler.fit(datasets['train']['data'])
         for tag, data_dict in datasets.items():
             data_dict['data'] = scaler.transform(data_dict['data'])
 
     print('Load and preprocessing complete!\n')
-
     return datasets
 
 # Sampling layer for the VAE
@@ -270,9 +408,16 @@ class VAETrainer:
             print("NaN detected in sampled z!")
             print("z stats:", tf.reduce_min(z), tf.reduce_max(z))
         
-        # Compute reconstruction loss (MSE)
+        # Create mask for non-zero entries
+        mask = tf.cast(tf.not_equal(x, 0), tf.float32)
+        
+        # Compute squared differences and apply mask
+        squared_diff = tf.square(x - reconstruction) * mask
+        
+        # Sum over features for each sample and divide by number of non-zero features
+        num_nonzero = tf.reduce_sum(mask, axis=1)
         reconstruction_loss = tf.reduce_mean(
-            tf.reduce_sum(tf.square(x - reconstruction), axis=1)
+            tf.reduce_sum(squared_diff, axis=1) / (num_nonzero + tf.keras.backend.epsilon())
         )
         
         # Compute KL divergence with numerical stability
@@ -660,7 +805,15 @@ def load_vae(save_path, input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dr
 
 # Define different AD score metrics
 def MSE_AD_score(y_true, y_pred):
-    return np.mean(np.square(y_true - y_pred), axis=-1)
+    # Create mask for non-zero entries
+    mask = np.not_equal(y_true, 0)
+    
+    # Compute squared differences and apply mask
+    squared_diff = np.square(y_true - y_pred) * mask
+    
+    # Sum over features for each sample and divide by number of non-zero features
+    num_nonzero = np.sum(mask, axis=-1)
+    return np.sum(squared_diff, axis=-1) / (num_nonzero + np.finfo(float).eps)
 
 def KL_AD_score(z_mean, z_log_var):
     return np.mean(0.5 * (np.exp(z_log_var) - 1 - z_log_var + np.square(z_mean)), axis=-1)
@@ -703,20 +856,14 @@ def create_xgb_student():
         random_state=42
     )
 
-# Training the student networks
-def train_student_networks(datasets, save_path, h_dim_1, h_dim_2, l2_reg=0.01, dropout_rate=0.1, batch_size=128, epochs=100, stop_patience=8, lr_patience=4):
-    print('Initializing knowledge distillation procedure...')
+# Training the neural network student
+def train_nn_student(datasets, save_path, h_dim_1, h_dim_2, l2_reg=0.01, dropout_rate=0.1, batch_size=128, epochs=100, stop_patience=8, lr_patience=4):
+    print('Initializing neural network knowledge distillation procedure...')
     
     # Create the neural network student
     print('Creating neural network student...')
     input_dim = datasets['train']['data'].shape[1]
     nn_student = create_student_network(input_dim, h_dim_1, h_dim_2, l2_reg=l2_reg, dropout_rate=dropout_rate)
-
-    # Create the XGBoost student if available
-    xgb_student = None
-    if XGBOOST_AVAILABLE:
-        print('Creating XGBoost student...')
-        xgb_student = create_xgb_student()
 
     # Compile neural network student
     nn_student.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.01), loss='mse')
@@ -730,32 +877,135 @@ def train_student_networks(datasets, save_path, h_dim_1, h_dim_2, l2_reg=0.01, d
     print('Starting training of the neural network student.')
     nn_history = nn_student.fit(
         datasets['train']['data'], 
-        datasets['train']['MSE_KL_AD_scores'],
+        datasets['train']['MSE_AD_scores'],
         batch_size=batch_size,
         epochs=epochs,
-        validation_data=(datasets['val']['data'], datasets['val']['MSE_KL_AD_scores']),
+        validation_data=(datasets['val']['data'], datasets['val']['MSE_AD_scores']),
         callbacks=callbacks
     )
 
-    # Train XGBoost student if available
-    if XGBOOST_AVAILABLE and xgb_student is not None:
-        print('Starting training of the XGBoost student.')
-        xgb_student.fit(
-            datasets['train']['data'],
-            datasets['train']['MSE_KL_AD_scores'],
-            eval_set=[(datasets['val']['data'], datasets['val']['MSE_KL_AD_scores'])],
-            early_stopping_rounds=20,
-            verbose=True
-        )
-
-    # Save the models
-    print('Saving student networks...')
+    # Save the model
+    print('Saving neural network student...')
     nn_student.save_weights(f'{save_path}/nn_student.weights.h5')
-    if XGBOOST_AVAILABLE and xgb_student is not None:
-        xgb_student.save_model(f'{save_path}/xgb_student.json')
-    print('Student networks saved! Knowledge distillation complete.')
+    print('Neural network student saved! Knowledge distillation complete.')
 
-    return nn_student, xgb_student
+    return nn_student
+
+# Training the XGBoost student
+def train_xgb_student(datasets, save_path):
+    """Train and save an XGBoost student model for anomaly detection."""
+    if not XGBOOST_AVAILABLE:
+        raise ImportError("XGBoost is not available in the current environment")
+    
+    print('Initializing XGBoost knowledge distillation procedure...')
+    print('Creating XGBoost student...')
+    xgb_student = create_xgb_student()
+
+    # Train XGBoost student
+    print('Starting training of the XGBoost student.')
+    xgb_student.fit(
+        datasets['train']['data'],
+        datasets['train']['MSE_AD_scores'],
+        eval_set=[(datasets['val']['data'], datasets['val']['MSE_AD_scores'])],
+        early_stopping_rounds=20,
+        verbose=True
+    )
+
+    # Save the model
+    print('Saving XGBoost student...')
+    xgb_student.save_model(f'{save_path}/xgb_student.json')
+    print('XGBoost student saved! Knowledge distillation complete.')
+
+    return xgb_student
+
+def evaluate_VAE_nn(datasets, model_path, plots_path, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropout_rate=0.1, beta=0.5, train_students=False, load_students=True):
+    print('Beginning neural network evaluation procedure... booting up...')
+    
+    # Calculate the AD scores for each dataset
+    print('Calculating AD scores for each dataset...')
+    datasets = calculate_AD_scores(datasets, model_path, h_dim_1, h_dim_2, latent_dim, l2_reg, dropout_rate, beta)
+
+    input_dim = datasets['train']['data'].shape[1]
+
+    # Train or load the neural network student
+    if train_students:   
+        print('Training neural network student...')
+        nn_student = train_nn_student(datasets, model_path, h_dim_1, h_dim_2)
+    elif load_students:
+        print('Loading neural network student...')
+        # Load neural network student
+        nn_student = create_student_network(input_dim, h_dim_1, h_dim_2, l2_reg=l2_reg, dropout_rate=dropout_rate)
+        nn_student.load_weights(f'{model_path}/nn_student.weights.h5')
+        print('Neural network student loaded!')
+
+    # Run inference on the neural network student
+    if train_students or load_students:
+        print('Running inference on the neural network student...')
+        for tag, data_dict in datasets.items():
+            data_dict['nn_student_AD_scores'] = nn_student.predict(data_dict['data'])
+
+    return datasets
+
+def evaluate_VAE_xgb(datasets, model_path, plots_path, train_students=False, load_students=True):
+    print('Beginning XGBoost evaluation procedure... booting up...')
+    
+    if not XGBOOST_AVAILABLE:
+        raise ImportError("XGBoost is not available in the current environment")
+
+    # Train or load the XGBoost student
+    if train_students:   
+        print('Training XGBoost student...')
+        xgb_student = train_xgb_student(datasets, model_path)
+    elif load_students:
+        print('Loading XGBoost student...')
+        if os.path.exists(f'{model_path}/xgb_student.json'):
+            xgb_student = create_xgb_student()
+            xgb_student.load_model(f'{model_path}/xgb_student.json')
+            print('XGBoost student loaded!')
+        else:
+            raise FileNotFoundError("XGBoost student model not found")
+
+    # Run inference on the XGBoost student
+    if train_students or load_students:
+        print('Running inference on the XGBoost student...')
+        for tag, data_dict in datasets.items():
+            data_dict['xgb_student_AD_scores'] = xgb_student.predict(data_dict['data'])
+        print('Inference complete! Plotting student performance...')
+        plot_student_performance(datasets, plots_path)
+
+    # Plot the ROC curves
+    print('Plotting ROC curves...')
+    plot_ROC_curves(datasets, plots_path, use_students=True)
+    print('ROC curves plotted! Evaluation complete.')
+
+    return datasets
+
+def calculate_AD_scores(datasets, model_path, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropout_rate=0.1, beta=0.5):
+    
+    # Load the VAE
+    input_dim = datasets['train']['data'].shape[1]
+    loaded_vae, loaded_encoder, loaded_decoder = load_vae(model_path, input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg, dropout_rate)
+
+    # Loop over the datasets
+    for tag, data_dict in datasets.items():
+
+        print(f'Evaluating {tag} set...')
+
+        # Run inference on the VAE
+        y_pred, z_mean, z_log_var = loaded_vae.predict(data_dict['data'])
+
+        # Store the results
+        data_dict['y_pred'] = y_pred
+        data_dict['z_mean'] = z_mean
+        data_dict['z_log_var'] = z_log_var
+
+        # Calculate the AD scores
+        data_dict['MSE_AD_scores'] = MSE_AD_score(data_dict['data'], y_pred)
+        data_dict['KL_AD_scores'] = KL_AD_score(z_mean, z_log_var)
+        data_dict['clipped_KL_AD_scores'] = clipped_KL_AD_score(z_mean)
+        data_dict['MSE_KL_AD_scores'] = MSE_KL_AD_score(data_dict['data'], y_pred, z_mean, z_log_var, beta=beta)
+
+    return datasets
 
 def plot_student_performance(datasets, plots_path):
     """Plot scatter plots comparing true AD scores vs predicted scores for both students."""
@@ -776,12 +1026,12 @@ def plot_student_performance(datasets, plots_path):
     for tag, data_dict in datasets.items():
         if tag in skip_tags:
             continue
-        plt.scatter(data_dict['MSE_KL_AD_scores'], data_dict['nn_student_AD_scores'], label=f'{tag}', alpha=0.6)
+        plt.scatter(data_dict['MSE_AD_scores'], data_dict['nn_student_AD_scores'], label=f'{tag}', alpha=0.6)
 
     min_val = min(plt.xlim()[0], plt.ylim()[0])
     max_val = max(plt.xlim()[1], plt.ylim()[1])
     plt.plot([min_val, max_val], [min_val, max_val], '--', color='grey', label='Perfect Performance')
-    plt.xlabel('MSE + KL', fontsize=20)
+    plt.xlabel('MSE', fontsize=20)
     plt.ylabel('Neural Network Student', fontsize=20)
     plt.legend(loc='lower right', fontsize=15)
     plt.title('Neural Network Student Performance', fontsize=20)
@@ -792,12 +1042,12 @@ def plot_student_performance(datasets, plots_path):
         for tag, data_dict in datasets.items():
             if tag in skip_tags:
                 continue
-            plt.scatter(data_dict['MSE_KL_AD_scores'], data_dict['xgb_student_AD_scores'], label=f'{tag}', alpha=0.6)
+            plt.scatter(data_dict['MSE_AD_scores'], data_dict['xgb_student_AD_scores'], label=f'{tag}', alpha=0.6)
 
         min_val = min(plt.xlim()[0], plt.ylim()[0])
         max_val = max(plt.xlim()[1], plt.ylim()[1])
         plt.plot([min_val, max_val], [min_val, max_val], '--', color='grey', label='Perfect Performance')
-        plt.xlabel('MSE + KL', fontsize=20)
+        plt.xlabel('MSE', fontsize=20)
         plt.ylabel('XGBoost Student', fontsize=20)
         plt.legend(loc='lower right', fontsize=15)
         plt.title('XGBoost Student Performance', fontsize=20)
@@ -879,76 +1129,5 @@ def plot_ROC_curves(datasets, plots_path, use_students=True):
         # Save
         plt.savefig(os.path.join(plots_path, f'{tag}_ROC_curves.png'))
         plt.close()
-
-def evaluate_VAE(datasets, model_path, plots_path, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropout_rate=0.1, beta=0.5, train_students=False, load_students=True):
-    print('Beginning evaluation procedure... booting up...')
-    
-    # Calculate the AD scores for each dataset
-    print('Calculating AD scores for each dataset...')
-    datasets = calculate_AD_scores(datasets, model_path, h_dim_1, h_dim_2, latent_dim, l2_reg, dropout_rate, beta)
-
-    input_dim = datasets['train']['data'].shape[1]
-
-    # Train or load the student networks
-    if train_students:   
-        print('Training student networks...')
-        nn_student, xgb_student = train_student_networks(datasets, model_path, h_dim_1, h_dim_2)
-    elif load_students:
-        print('Loading student networks...')
-        # Load neural network student
-        nn_student = create_student_network(input_dim, h_dim_1, h_dim_2, l2_reg=l2_reg, dropout_rate=dropout_rate)
-        nn_student.load_weights(f'{model_path}/nn_student.weights.h5')
-        
-        # Load XGBoost student if available
-        xgb_student = None
-        if XGBOOST_AVAILABLE and os.path.exists(f'{model_path}/xgb_student.json'):
-            xgb_student = create_xgb_student()
-            xgb_student.load_model(f'{model_path}/xgb_student.json')
-        print('Student networks loaded!')
-
-    # Run inference on the student networks
-    if train_students or load_students:
-        print('Running inference on the student networks...')
-        for tag, data_dict in datasets.items():
-            data_dict['nn_student_AD_scores'] = nn_student.predict(data_dict['data'])
-            if XGBOOST_AVAILABLE and xgb_student is not None:
-                data_dict['xgb_student_AD_scores'] = xgb_student.predict(data_dict['data'])
-        print('Inference complete! Plotting student performance...')
-        plot_student_performance(datasets, plots_path)
-
-    # Plot the ROC curves
-    print('Plotting ROC curves...')
-    use_students = train_students or load_students
-    plot_ROC_curves(datasets, plots_path, use_students=use_students)
-    print('ROC curves plotted! Evaluation complete.')
-
-    return datasets
-
-def calculate_AD_scores(datasets, model_path, h_dim_1, h_dim_2, latent_dim, l2_reg=0.01, dropout_rate=0.1, beta=0.5):
-    
-    # Load the VAE
-    input_dim = datasets['train']['data'].shape[1]
-    loaded_vae, loaded_encoder, loaded_decoder = load_vae(model_path, input_dim, h_dim_1, h_dim_2, latent_dim, l2_reg, dropout_rate)
-
-    # Loop over the datasets
-    for tag, data_dict in datasets.items():
-
-        print(f'Evaluating {tag} set...')
-
-        # Run inference on the VAE
-        y_pred, z_mean, z_log_var = loaded_vae.predict(data_dict['data'])
-
-        # Store the results
-        data_dict['y_pred'] = y_pred
-        data_dict['z_mean'] = z_mean
-        data_dict['z_log_var'] = z_log_var
-
-        # Calculate the AD scores
-        data_dict['MSE_AD_scores'] = MSE_AD_score(data_dict['data'], y_pred)
-        data_dict['KL_AD_scores'] = KL_AD_score(z_mean, z_log_var)
-        data_dict['clipped_KL_AD_scores'] = clipped_KL_AD_score(z_mean)
-        data_dict['MSE_KL_AD_scores'] = MSE_KL_AD_score(data_dict['data'], y_pred, z_mean, z_log_var, beta=beta)
-
-    return datasets
         
     
