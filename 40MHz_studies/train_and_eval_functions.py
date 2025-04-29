@@ -385,7 +385,7 @@ class VAETrainer:
         stage_idx = np.searchsorted(self.stage_boundaries, epoch, side='right')
         return self.learning_rates[stage_idx]
         
-    def compute_losses(self, x):
+    def compute_losses(self, x, beta=None):
         """Compute all components of the loss"""
         # Ensure input is float32
         x = tf.cast(x, tf.float32)
@@ -394,16 +394,16 @@ class VAETrainer:
         mean, log_var, z = self.encoder(x)
         reconstruction = self.decoder(z)
         
-        # Debug: Check components
-        if tf.math.reduce_any(tf.math.is_nan(mean)):
-            print("NaN detected in mean!")
-            print("mean stats:", tf.reduce_min(mean), tf.reduce_max(mean))
-        if tf.math.reduce_any(tf.math.is_nan(log_var)):
-            print("NaN detected in log_var!")
-            print("log_var stats:", tf.reduce_min(log_var), tf.reduce_max(log_var))
-        if tf.math.reduce_any(tf.math.is_nan(z)):
-            print("NaN detected in sampled z!")
-            print("z stats:", tf.reduce_min(z), tf.reduce_max(z))
+        # # Debug: Check components
+        # if tf.math.reduce_any(tf.math.is_nan(mean)):
+        #     print("NaN detected in mean!")
+        #     print("mean stats:", tf.reduce_min(mean), tf.reduce_max(mean))
+        # if tf.math.reduce_any(tf.math.is_nan(log_var)):
+        #     print("NaN detected in log_var!")
+        #     print("log_var stats:", tf.reduce_min(log_var), tf.reduce_max(log_var))
+        # if tf.math.reduce_any(tf.math.is_nan(z)):
+        #     print("NaN detected in sampled z!")
+        #     print("z stats:", tf.reduce_min(z), tf.reduce_max(z))
         
         # Create mask for non-zero entries
         mask = tf.cast(tf.not_equal(x, 0), tf.float32)
@@ -435,7 +435,7 @@ class VAETrainer:
         )
         
         # Get current beta value from the trainer's state
-        current_beta = self.current_beta
+        current_beta = beta if beta is not None else self.current_beta
         
         # Total loss with current beta
         total_loss = reconstruction_loss + current_beta * kl_loss
@@ -443,10 +443,10 @@ class VAETrainer:
         return total_loss, reconstruction_loss, kl_loss
     
     @tf.function
-    def train_step(self, x):
+    def train_step(self, x, beta):
         """Single training step"""
         with tf.GradientTape() as tape:
-            total_loss, reconstruction_loss, kl_loss = self.compute_losses(x)
+            total_loss, reconstruction_loss, kl_loss = self.compute_losses(x, beta)
             
         # Compute gradients
         trainable_vars = (
@@ -486,7 +486,7 @@ class VAETrainer:
             }
             
             for batch_idx, batch in enumerate(train_ds):
-                total_loss, reconstruction_loss, kl_loss = self.train_step(batch)
+                total_loss, reconstruction_loss, kl_loss = self.train_step(batch, self.current_beta)
                 
                 # Check for NaN losses during training
                 if tf.math.is_nan(total_loss) or tf.math.is_nan(reconstruction_loss) or tf.math.is_nan(kl_loss):
