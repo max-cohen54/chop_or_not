@@ -25,9 +25,6 @@ def load_subdicts_from_h5(save_dir):
     for filename in os.listdir(save_dir):
         if filename.endswith(".h5") and not filename.startswith('.'):
 
-            # Make sure it's a file (not directory!)
-            if not os.path.isfile(file_path):
-                continue
 
             
             sub_dict_name = os.path.splitext(filename)[0]
@@ -202,7 +199,7 @@ def load_and_preprocess(data_path, standard_scaler=True, zero_aware_scaling=Fals
             scaler = ZeroAwareStandardScaler()
         else:
             print('Using standard scaling...')
-            scaler = StandardScaler()
+        scaler = StandardScaler()
             
         scaler.fit(datasets['train']['data'])
         for tag, data_dict in datasets.items():
@@ -387,7 +384,7 @@ class VAETrainer:
         # Find the stage for the current epoch
         stage_idx = np.searchsorted(self.stage_boundaries, epoch, side='right')
         return self.learning_rates[stage_idx]
-
+        
     def compute_losses(self, x):
         """Compute all components of the loss"""
         # Ensure input is float32
@@ -420,12 +417,19 @@ class VAETrainer:
             tf.reduce_sum(squared_diff, axis=1) / (num_nonzero + tf.keras.backend.epsilon())
         )
         
+        
+        #reconstruction_loss = tf.reduce_mean(tf.reduce_sum(tf.square(x - reconstruction), axis=1))
+
+
+        log_var_clipped = tf.clip_by_value(log_var, -20.0, 20.0)
+        mean_clipped = tf.clip_by_value(mean, -100.0, 100.0)
+        mean_squared_clipped = tf.square(mean_clipped)  # Now safe to square
+        exp_log_var_clipped = tf.exp(log_var_clipped)   # Now safe to exp
+        
         # Compute KL divergence with numerical stability
         kl_loss = -0.5 * tf.reduce_mean(
             tf.reduce_sum(
-                1 + tf.clip_by_value(log_var, -20.0, 20.0) - 
-                tf.clip_by_value(tf.square(mean), 0.0, 100.0) - 
-                tf.clip_by_value(tf.exp(log_var), 1e-20, 1e20), 
+                1 + log_var_clipped - mean_squared_clipped - exp_log_var_clipped,
                 axis=1
             )
         )
@@ -539,7 +543,7 @@ class VAETrainer:
                 self.best_weights = [tf.identity(w) for w in self.vae.get_weights()]
         
         # At the end of training, use the best weights
-        self.vae.set_weights(self.best_weights)
+                self.vae.set_weights(self.best_weights)
 
     def plot_history(self, save_path):
         """Plot and save training history including losses, beta schedule, and learning rate."""
@@ -664,7 +668,7 @@ def train_VAE(datasets, h_dim_1, h_dim_2, latent_dim, model_path, l2_reg=0.01,
         # Create the VAE
         input_dim = datasets['train']['data'].shape[1]
         vae, encoder, decoder = create_small_VAE(input_dim, h_dim_1, h_dim_2, 
-                                               latent_dim, l2_reg, dropout_rate)
+                                            latent_dim, l2_reg, dropout_rate)
         
         # Create trainer
         trainer = VAETrainer(
@@ -883,7 +887,7 @@ def train_nn_student(datasets, save_path, h_dim_1, h_dim_2, l2_reg=0.01, dropout
         validation_data=(datasets['val']['data'], datasets['val']['MSE_AD_scores']),
         callbacks=callbacks
     )
-
+    
     # Save the model
     print('Saving neural network student...')
     nn_student.save_weights(f'{save_path}/nn_student.weights.h5')
@@ -907,7 +911,6 @@ def train_xgb_student(datasets, save_path):
         datasets['train']['data'],
         datasets['train']['MSE_AD_scores'],
         eval_set=[(datasets['val']['data'], datasets['val']['MSE_AD_scores'])],
-        early_stopping_rounds=20,
         verbose=True
     )
 
@@ -1044,13 +1047,13 @@ def plot_student_performance(datasets, plots_path):
                 continue
             plt.scatter(data_dict['MSE_AD_scores'], data_dict['xgb_student_AD_scores'], label=f'{tag}', alpha=0.6)
 
-        min_val = min(plt.xlim()[0], plt.ylim()[0])
-        max_val = max(plt.xlim()[1], plt.ylim()[1])
-        plt.plot([min_val, max_val], [min_val, max_val], '--', color='grey', label='Perfect Performance')
-        plt.xlabel('MSE', fontsize=20)
-        plt.ylabel('XGBoost Student', fontsize=20)
-        plt.legend(loc='lower right', fontsize=15)
-        plt.title('XGBoost Student Performance', fontsize=20)
+    min_val = min(plt.xlim()[0], plt.ylim()[0])
+    max_val = max(plt.xlim()[1], plt.ylim()[1])
+    plt.plot([min_val, max_val], [min_val, max_val], '--', color='grey', label='Perfect Performance')
+    plt.xlabel('MSE', fontsize=20)
+    plt.ylabel('XGBoost Student', fontsize=20)
+    plt.legend(loc='lower right', fontsize=15)
+    plt.title('XGBoost Student Performance', fontsize=20)
 
     # Save
     plt.tight_layout()
