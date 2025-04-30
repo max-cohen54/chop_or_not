@@ -344,10 +344,6 @@ class VAETrainer:
             'learning_rate': []  # Track learning rates
         }
         
-        # Track best model weights
-        self.best_loss = float('inf')
-        self.best_weights = None
-        
     def get_beta(self, epoch, total_epochs):
         """Compute beta value for the current epoch using either cyclical or standard annealing schedule."""
         if self.annealing_type == 'cyclical':
@@ -537,13 +533,11 @@ class VAETrainer:
             print(f'Total Loss: {train_total:.4f} - Reconstruction: {train_reconstruction:.4f} - KL: {train_kl:.4f}')
             print(f'Val Total Loss: {val_total:.4f} - Val Reconstruction: {val_reconstruction:.4f} - Val KL: {val_kl:.4f}')
             
-            # Track best weights (for final model)
-            if val_total < self.best_loss:
-                self.best_loss = val_total
-                self.best_weights = [tf.identity(w) for w in self.vae.get_weights()]
+            # We don't track the best weights anymore as it's not appropriate for beta annealing
+            # Instead, we'll just use the final weights after training completes
         
-        # At the end of training, use the best weights
-                self.vae.set_weights(self.best_weights)
+        # No need to set weights at the end of training since we're keeping the final state
+        # The final state already has the weights we want to use
 
     def plot_history(self, save_path):
         """Plot and save training history including losses, beta schedule, and learning rate."""
